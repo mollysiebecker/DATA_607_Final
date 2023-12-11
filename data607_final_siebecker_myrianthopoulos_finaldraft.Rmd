@@ -1,0 +1,524 @@
+---
+title: "DATA 607 Final Project"
+author: "Siebecker/Myrianthopoulos"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Introduction
+
+Fivethirtyeight’s political polling database calculates the accuracy of polls according to two metrics:
+
+1) A poll’s “error” refers to how far it missed the actual election outcome by. For example, a poll that shows a Democrat five points ahead in a race where the Democrat actually wins by two points has an error of three points.
+
+2) A poll’s “bias” refers to in which direction a poll missed the actual election outcome by. In fivethirtyeight's database, polls which overstate the Democratic margin (for example, predicting a Democratic win by 5 points when the Democratic candidate actually only wins by two points) have a positive bias, and polls which overstate the Republican margin (for example, predicting a Democratic win by 2 points when the Democratic candidate actually wins by five points) have a negative bias.
+
+In this project, we investigate the relative error and bias of non-partisan polls, and those that are affiliated with either the Democratic party or the Republican party. We will consider:
+
+1) Do partisan-affiliated polls have greater error than non-partisan polls? Is this true when considering polls affiliated with party separately?
+2) Do polls affiliated with one party have a greater error than polls affiliated with the other?
+3) Are partisan-affiliated polls more prone to bias than non-partisan polls?
+4) Are polls affiliated with one party more prone to bias than polls affiliated with the other?
+
+We will use fivethirtyeight's raw-polls data in this analysis, which is loaded below.
+
+```{r}
+knitr::opts_chunk$set(eval = TRUE, message = FALSE, warning = FALSE)
+
+#Loads required libraries
+library(tidyverse)
+library(jsonlite)
+library(infer)
+library(kableExtra)
+
+#Imports the data from fivethirtyeight.com's github repository
+all_polls_data <- read.csv("https://raw.githubusercontent.com/fivethirtyeight/data/master/pollster-ratings/raw-polls.csv")
+
+set.seed(1989)
+```
+
+# Data Verification
+
+To confirm that fivethirtyeight's database has accurate election results (which are used to calculate the error and bias for polls) we import CNN's election results by state from the 2020 Presidential Election and compare them to fivethirtyeight's.
+
+```{r}
+
+#Imports the data from CNN
+jsondata <- fromJSON("https://politics-elex-results.data.api.cnn.io/results/view/2020-national-races-PG.json")
+
+#Prepares the JSON data to be merged with fivethirtyeight's
+jsondata_wide <- jsondata %>% unnest(candidates)
+jsondata_final <- jsondata_wide %>%
+  select(stateAbbreviation, majorParty, votePercentStr) %>%
+  pivot_wider(names_from = majorParty, values_from = votePercentStr) %>%
+  select(stateAbbreviation, DEM, REP) %>%
+  rename(location = stateAbbreviation, dem_cnn = DEM, rep_cnn = REP) %>%
+  arrange(location)
+
+#Converts the columns to numeric data so they can be subtracted to determine how different the results are
+jsondata_final$dem_cnn <- as.numeric(jsondata_final$dem_cnn)
+jsondata_final$rep_cnn <- as.numeric(jsondata_final$rep_cnn)
+
+#Filters fivethirtyeight's data to extract only 2020 Presidential election results by state, combines them with CNNs data, and calculates how different the D and R results in each state are
+pres2020 <- all_polls_data %>%
+  filter(year == 2020) %>%
+  filter(type_simple == "Pres-G") %>%
+  select(location, cand1_actual, cand2_actual) %>%
+  rename(dem = cand1_actual, rep = cand2_actual) %>%
+  distinct %>%
+  filter(!location %in% c("M1", "M2", "N2", "US")) %>%
+  arrange(location) %>%
+  left_join(jsondata_final) %>%
+  mutate(dem_diff = dem_cnn - dem) %>%
+  mutate(rep_diff = rep_cnn - rep) %>%
+  mutate(combined_error = abs(dem_diff) + abs(rep_diff)) %>%
+  filter(combined_error >= 0.5) %>%
+  arrange(desc(combined_error))
+
+kable(pres2020, align = "lccccccc")
+
+```
+
+CNN and fivethirtyeight have data that matches very closely. No candidate result is off by so much as a single point, and only two states have a combined error of more than 0.62 points. We consider this sufficient to verify the accuracy of fivethirtyeight's data.
+
+# Data Cleaning
+
+Since we want to compare not only the average error but also the bias of partisan and non-partisan polls, we need to limit our analysis to races between a Republican and a Democrat. We also want to avoid runoff and special elections, which present unique polling challenges, and polls with a significant third-party vote share (which we define as greater than 10%). This limits our analysis to polls of non-runoff, non-special general election races between a Democrat and a Republican with no significant third-party presence. In the code block below, we filter the polls database to include only these polls.
+
+```{r}
+
+#Selects relevant polls.
+general_dr_polls <- all_polls_data %>%
+  filter(cand1_party == "DEM" & cand2_party == "REP") %>% #Only rows with a Democrat and Republican.
+  filter(partisan %in% c("", "D", "R")) %>% #Only rows with D and R partisan or non-partisan polls.
+  filter(str_detect(type_detail, "G$")) %>% #Only rows representing a general election that is not a special or run-off election.
+  filter(cand3_pct<10) %>%
+  filter(year >= 2000)
+
+#Replaces blank in non-partisan polls with "NP".
+general_dr_polls$partisan[which(general_dr_polls$partisan == "")] <- "NP"
+
+```
+
+# Descriptive/Exploratory Analysis
+
+## Comparing Error By Poll Partisan Affiliation
+
+The first analysis we want to perform is to compare the average error from polls based on their partisan status (non-partisan, Democratic, or Republican).
+
+```{r}
+
+basic_error_analysis <- general_dr_polls %>%
+  group_by(partisan) %>%
+  mutate(avg_error = mean(error)) %>%
+  mutate(median_error = median(error)) %>%
+  ungroup() %>%
+  select(partisan, avg_error, median_error) %>%
+  rename(`Average Error` = avg_error, `Median Error` = median_error) %>%
+  distinct() %>%
+  pivot_longer(!1, names_to = "type", values_to = "error")
+
+ggplot(data = basic_error_analysis, aes(x = type, y = error, fill = partisan)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Error by Poll Partisan Affiliation", x = "", y = "Percent Error", fill = "Partisan Affiliation") +
+  scale_fill_manual(values = c("D" = "blue", "NP" = "gray", "R" = "red")) +
+  scale_y_continuous(breaks = seq(0,6,by = 1)) +
+  geom_text(aes(label = round(error,2)), position = position_dodge(width = 0.9), vjust = -.5)
+
+```
+
+Non-partisan polls in our sample had an average error of 4.65% and a median error of 3.85%, Republican-affiliated polls had slightly higher errors with an average error of 4.67% and a median error of 4.04%, and Democratic-affiliated polls were noticeably worse with an average error of 5.95% and a median error of 4.89%.
+
+We also want to compare the average and median error of these polls by election cycle, to get a sense of how the relative accuracy of the partisan-affiliated polls has changed over time.
+
+```{r}
+
+annual_error_average <- general_dr_polls %>%
+  filter(year %% 2 == 0) %>%
+  group_by(partisan, year) %>%
+  mutate(avg_error = mean(error)) %>%
+  ungroup() %>%
+  select(year, partisan, avg_error) %>%
+  distinct()
+
+ggplot(annual_error_average, mapping = aes(x = year, y = avg_error, group = partisan, color = partisan)) + 
+  geom_point() +
+  geom_line() +
+  labs(title = "Average Error in Partisan Polls by Year", x = "Year", y = "Average Error", fill = "Poll Affiliation") +
+  scale_color_manual(values = c("D" = "blue", "R" = "red", "NP" = "gray")) +
+  scale_x_continuous(breaks = seq(1998,2022,by = 2)) +
+  scale_y_continuous(breaks = seq(0,20,by = 2)) + 
+  theme(panel.grid.minor = element_blank())
+
+annual_error_median <- general_dr_polls %>%
+  filter(year %% 2 == 0) %>%
+  group_by(partisan, year) %>%
+  mutate(med_error = median(error)) %>%
+  ungroup() %>%
+  select(year, partisan, med_error) %>%
+  distinct()
+
+ggplot(annual_error_median, mapping = aes(x = year, y = med_error, group = partisan, color = partisan)) + 
+  geom_point() +
+  geom_line() +
+  labs(title = "Median Error in Partisan Polls by Year", x = "Year", y = "Median Error", fill = "Poll Affiliation") +
+  scale_color_manual(values = c("D" = "blue", "R" = "red", "NP" = "gray")) +
+  scale_x_continuous(breaks = seq(1998,2022,by = 2)) +
+  scale_y_continuous(breaks = seq(0,20,by = 2)) + 
+  theme(panel.grid.minor = element_blank())
+
+```
+
+The average and median polling errors by partisan status are very inconsistent from year to year. Every year since 2012, polls affiliated with one party have had a lower average error than the non-partisan polls, and polls affiliated with the other party have had a higher average error, but which party is which changes. A similar pattern is observed when considering the median error.
+
+## Comparing Bias by Poll Partisan Affiliation
+
+In addition to considering polling error, we also want to consider whether partisan-affiliated polls are more biased than non-partisan polls, that is, whether they consistently favor one party or the other. For bias, negative numbers indicate a bias toward Republicans and positive numbers indicate a bias toward Democrats. We first look at the average and median bias of all polls in our sample.
+
+```{r}
+
+basic_bias_analysis <- general_dr_polls %>%
+  group_by(partisan) %>%
+  mutate(avg_bias = mean(bias)) %>%
+  mutate(median_bias = median(bias)) %>%
+  ungroup() %>%
+  select(partisan, avg_bias, median_bias) %>%
+  rename(`Average Bias` = avg_bias, `Median Bias` = median_bias) %>%
+  distinct() %>%
+  pivot_longer(!1, names_to = "type", values_to = "error")
+
+ggplot(data = basic_bias_analysis, aes(x = type, y = error, fill = partisan)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Bias by Poll Partisan Affiliation", x = "", y = "Percent Bias", fill = "Partisan Affiliation") +
+  scale_fill_manual(values = c("D" = "blue", "NP" = "gray", "R" = "red")) +
+  scale_y_continuous(breaks = seq(-6,6,by = 1)) +
+  geom_text(aes(label = round(error,2)), position = position_dodge(width = 0.9), vjust = -.25)
+
+```
+
+Non-partisan polls in our sample had an average and median bias of 1.47% (again, as a positive number this refers to a bias toward Democrats). Republican-affiliated polls had an average bias of -2.44% and a median bias of -2.29%, and Democratic-affiliated polls had an average bias of 5.04% and a median bias of 4.77%.
+
+Just as with error, we also want to look at how these numbers have changed in different election cycles.
+
+```{r}
+
+annual_bias_average <- general_dr_polls %>%
+  filter(year %% 2 == 0) %>%
+  group_by(partisan, year) %>%
+  mutate(avg_bias = mean(bias)) %>%
+  ungroup() %>%
+  select(year, partisan, avg_bias) %>%
+  distinct()
+
+ggplot(annual_bias_average, mapping = aes(x = year, y = avg_bias, group = partisan, color = partisan)) + 
+  geom_point() +
+  geom_line() +
+  labs(title = "Average Bias in Partisan Polls by Year", x = "Year", y = "Average Bias", fill = "Poll Affiliation") +
+  scale_color_manual(values = c("D" = "blue", "R" = "red", "NP" = "gray")) +
+  scale_x_continuous(breaks = seq(1998,2022,by = 2)) +
+  scale_y_continuous(breaks = seq(-8,8,by = 1)) + 
+  theme(panel.grid.minor = element_blank())
+
+annual_bias_median <- general_dr_polls %>%
+  filter(year %% 2 == 0) %>%
+  group_by(partisan, year) %>%
+  mutate(med_bias = median(bias)) %>%
+  ungroup() %>%
+  select(year, partisan, med_bias) %>%
+  distinct()
+
+ggplot(annual_bias_median, mapping = aes(x = year, y = med_bias, group = partisan, color = partisan)) + 
+  geom_point() +
+  geom_line() +
+  labs(title = "Median Bias in Partisan Polls by Year", x = "Year", y = "Median Bias", fill = "Poll Affiliation") +
+  scale_color_manual(values = c("D" = "blue", "R" = "red", "NP" = "gray")) +
+  scale_x_continuous(breaks = seq(1998,2022,by = 2)) +
+  scale_y_continuous(breaks = seq(-8,8,by = 1)) + 
+  theme(panel.grid.minor = element_blank())
+
+```
+
+Unlike error, the average and median polling bias by partisan status move together from year to year. With the exception of Republicans in 2008 and both parties in 2002, the Republican-affiliated polls on average are more biased toward Republicans than the non-partisan polls and the Democratic-affiliated polls on average are more biased toward Democrats than the non-partisan polls every year. A similar pattern is evident with the medians, with the exception of Democrats in 2006 and both parties in 2002.
+
+To get a sense of how partisan-affiliated polls have shifted relative to non-partisan polls over time, we can subtract the average bias of non-partisan polls from the average bias of each party's affiliated polls. This results in the graph below, where a y-value of 0 (shown in bold) represents the average bias of non-partisan polls in that year. Positive and negative numbers on this graph now represent bias toward Democrats or Republicans relative to the bias of non-partisan polls, rather than relative to the actual election results. For example, in 2014 non-partisan polls had an average bias of about 4 points toward the Democrats, the Republican-affiliated polls had an average bias of about 3 points toward the Democrats, and the Democratic-affiliated polls had an average bias of about 7.5 points toward the Democrats. For 2014 on this plot, Democratic affiliated polls have a y-value of about 3.5 (since they were biased about 3.5 points more toward Democrats on average than non-partisan polls) and Republican-affiliated polls have a y-value of about -1 (since they were biased about 1 point more toward Republicans on average than non-partisan polls).
+
+```{r}
+
+environment_bias_mean <- general_dr_polls %>%
+  filter(year %% 2 == 0) %>%
+  group_by(partisan, year) %>%
+  mutate(avg_bias = mean(bias)) %>%
+  ungroup() %>%
+  select(year, partisan, avg_bias) %>%
+  distinct() %>%
+  pivot_wider(names_from = partisan, values_from = avg_bias) %>%
+  mutate(D_adj = D - NP) %>%
+  mutate(R_adj = R - NP) %>%
+  select(year, D_adj, R_adj) %>%
+  pivot_longer(!1, names_to = "partisan", values_to = "avg_bias")
+
+ggplot(environment_bias_mean, mapping = aes(x = year, y = avg_bias, group = partisan, color = partisan)) + 
+  geom_point() +
+  geom_line() +
+  labs(title = "Average Bias Shift Polls by Year", x = "Year", y = "Average Bias Shift", fill = "Poll Affiliation") +
+  scale_color_manual(values = c("D_adj" = "blue", "R_adj" = "red")) +
+  scale_x_continuous(breaks = seq(1998,2022,by = 2)) +
+  scale_y_continuous(breaks = seq(-8,8,by = 1)) + 
+  geom_hline(yintercept = 0, size = 3) +
+  theme(panel.grid.minor = element_blank())
+
+```
+
+This is another way to visualize our findings from the previous graphs: Democratic-affiliated polls are more biased toward Democrats than non-partisan polls across election cycles (the blue line mostly stays above y = 0) and Republican-affiliated polls are more biased toward Republicans than non-partisan polls across election cycles (the red line mostly stays below y = 0).
+
+# Analysis
+
+Below, we perform statistical analyses on the differences in means across parties for both error and bias to determine whether the differences shown above are significant or likely due to chance.
+
+## Error
+
+### Partisan-Affiliated vs. Non-Partisan
+
+On average, partisan polls are less accurate than non-partisan polls in our sample. Our null hypothesis is that the true means are equal, and the alternative hypothesis is that they are not equal. Below, we calculate the difference in the means, create a null distribution, visualize the null distribution alongside our observed statistic, and calculate the probability that the observed statistic occurs given that the null hypothesis is true. 
+
+```{r}
+
+#Creates new column indicating if a poll is partisan or non-partisan
+general_dr_polls <- general_dr_polls %>% 
+  mutate(partisan_tf = if_else(partisan == "D" | partisan == "R", "T", "F"))
+
+#Calculates observed difference in means
+d_hat_error_p <- general_dr_polls %>% 
+  specify(error ~ partisan_tf) %>% 
+  calculate(stat = "diff in means", order = c("T", "F"))
+
+#Creates null distribution
+null_dist_error_p <- general_dr_polls %>%
+  specify(error ~ partisan_tf) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 1000, type = "permute") %>%
+  calculate(stat = "diff in means", order = c("T", "F"))
+
+#Visualizes null distribution with observed statistic
+visualize(null_dist_error_p) +
+  shade_p_value(obs_stat = d_hat_error_p, direction = "two-sided")
+
+#Calculates p-value
+null_dist_error_p %>%
+  get_p_value(obs_stat = d_hat_error_p, direction = "two-sided")
+
+```
+
+We reject the null hypothesis, and conclude that partisan polls are meaningfully less accurate than non-partisan polls. Is one party meaningfully less accurate than another?
+
+### Democratic-Affiliated vs. Non-Partisan
+
+On average, Democratic polls are less accurate than non-partisan polls in our sample. Our null hypothesis is that the true means are equal, and the alternative hypothesis is that they are not equal. Below, we repeat the process of testing for significance in the difference in means.
+
+```{r}
+
+#Calculates observed difference in means
+d_hat_error_d <- general_dr_polls %>% 
+  filter(partisan == "D" | partisan == "NP") %>%
+  specify(error ~ partisan) %>% 
+  calculate(stat = "diff in means", order = c("D", "NP"))
+
+#Creates null distribution
+null_dist_error_d <- general_dr_polls %>%
+  filter(partisan == "D" | partisan == "NP") %>%
+  specify(error ~ partisan) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 1000, type = "permute") %>%
+  calculate(stat = "diff in means", order = c("D", "NP"))
+
+#Visualizes null distribution with observed statistic
+visualize(null_dist_error_d) +
+  shade_p_value(obs_stat = d_hat_error_d, direction = "two-sided")
+
+#Calculates p-value
+null_dist_error_d %>%
+  get_p_value(obs_stat = d_hat_error_d, direction = "two-sided")
+
+```
+
+We reject the null hypothesis, and conclude that Democratic-affiliated polls are meaningfully less accurate than non-partisan polls.
+
+### Republican-Affiliated vs. Non-Partisan
+
+On average, Republican polls are about as accurate as non-partisan polls in our sample. Our null hypothesis is that the true means are equal, and the alternative hypothesis is that they are not equal. Below, we repeat the process of testing for significance in the difference in means.
+
+```{r}
+
+#Calculates observed difference in means
+d_hat_error_r <- general_dr_polls %>% 
+  filter(partisan == "R" | partisan == "NP") %>%
+  specify(error ~ partisan) %>% 
+  calculate(stat = "diff in means", order = c("R", "NP"))
+
+#Creates null distribution
+null_dist_error_r <- general_dr_polls %>%
+  filter(partisan == "R" | partisan == "NP") %>%
+  specify(error ~ partisan) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 1000, type = "permute") %>%
+  calculate(stat = "diff in means", order = c("R", "NP"))
+
+#Visualizes null distribution with observed statistic
+visualize(null_dist_error_r) +
+  shade_p_value(obs_stat = d_hat_error_r, direction = "two-sided")
+
+#Calculates p-value
+null_dist_error_r %>%
+  get_p_value(obs_stat = d_hat_error_r, direction = "two-sided")
+
+```
+
+We fail to reject the null hypothesis, and conclude that Republican polls are not meaningfully less accurate than non-partisan polls.
+
+### Democratic-Affiliated vs. Republican-Affiliated
+
+On average, Democratic polls are less accurate than Republican polls in our sample. Our null hypothesis is that the true means are equal, and the alternative hypothesis is that they are not equal. Below, we repeat the process of testing for significance in the difference in means.
+
+```{r}
+
+#Calculates observed difference in means
+d_hat_error_dvr <- general_dr_polls %>% 
+  filter(partisan == "R" | partisan == "D") %>%
+  specify(error ~ partisan) %>% 
+  calculate(stat = "diff in means", order = c("D", "R"))
+
+#Creates null distribution
+null_dist_error_dvr <- general_dr_polls %>%
+  filter(partisan == "R" | partisan == "D") %>%
+  specify(error ~ partisan) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 1000, type = "permute") %>%
+  calculate(stat = "diff in means", order = c("D", "R"))
+
+#Visualizes null distribution with observed statistic
+visualize(null_dist_error_dvr) +
+  shade_p_value(obs_stat = d_hat_error_dvr, direction = "two-sided")
+
+#Calculates p-value
+null_dist_error_dvr %>%
+  get_p_value(obs_stat = d_hat_error_dvr, direction = "two-sided")
+
+```
+
+We reject the null hypothesis, and conclude that Democratic-affiliated polls are meaningfully less accurate than Republican-affiliated polls.
+
+## Bias
+
+We encountered a challenge in performing analysis on bias, because bias has been defined to be towards Democrats in the positive direction and towards Republicans in the negative direction. Therefore, we cannot meaningfully perform a difference in means test on partisan vs non-partisan bias. First, we repeat the analysis to compare the bias of Democratic-affiliated and Republican-affiliated polls to non-partisan polls.
+
+### Democratic-Affiliated vs. Non-Partisan
+
+On average, Democratic polls are more biased than non-partisan polls in our sample. Our null hypothesis is that the true means are equal, and the alternative hypothesis is that they are not equal. Below, we repeat the process of testing for significance in the difference in means.
+
+```{r}
+
+#Calculates observed difference in means
+d_hat_bias_d <- general_dr_polls %>% 
+  filter(partisan == "D" | partisan == "NP") %>%
+  specify(bias ~ partisan) %>% 
+  calculate(stat = "diff in means", order = c("D", "NP"))
+
+#Creates null distribution
+null_dist_bias_d <- general_dr_polls %>%
+  filter(partisan == "D" | partisan == "NP") %>%
+  specify(bias ~ partisan) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 1000, type = "permute") %>%
+  calculate(stat = "diff in means", order = c("D", "NP"))
+
+#Visualizes null distribution with observed statistic
+visualize(null_dist_bias_d) +
+  shade_p_value(obs_stat = d_hat_bias_d, direction = "two-sided")
+
+#Calculates p-value
+null_dist_bias_d %>%
+  get_p_value(obs_stat = d_hat_bias_d, direction = "two-sided")
+
+```
+
+We reject the null hypothesis, and conclude that Democratic polls are meaningfully more biased than non-partisan polls.
+
+### Republican-Affiliated vs. Non-Partisan
+
+On average, Republican polls are more biased than non-partisan polls in our sample. Our null hypothesis is that the true means are equal, and the alternative hypothesis is that they are not equal. Below, we repeat the process of testing for significance in the difference in means. 
+
+```{r}
+
+#Calculates observed difference in means
+d_hat_bias_r <- general_dr_polls %>% 
+  filter(partisan == "R" | partisan == "NP") %>%
+  specify(bias ~ partisan) %>% 
+  calculate(stat = "diff in means", order = c("R", "NP"))
+
+#Creates null distribution
+null_dist_bias_r <- general_dr_polls %>%
+  filter(partisan == "R" | partisan == "NP") %>%
+  specify(bias ~ partisan) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 1000, type = "permute") %>%
+  calculate(stat = "diff in means", order = c("R", "NP"))
+
+#Visualizes null distribution with observed statistic
+visualize(null_dist_bias_r) +
+  shade_p_value(obs_stat = d_hat_bias_r, direction = "two-sided")
+
+#Calculates p-value
+null_dist_bias_r %>%
+  get_p_value(obs_stat = d_hat_bias_r, direction = "two-sided")
+
+```
+
+We reject the null hypothesis, and conclude that Republican polls are meaningfully more biased than non-partisan polls.
+
+### Democratic-Affiliated vs. Republican-Affiliated
+
+Although we cannot compare partisan-affiliated vs. non-partisan bias with the available information, we can compare Democratic-affiliated vs. Republican-affiliated bias by adding a new variable to our data. Since bias towards Republicans is defined in the negative direction, if we multiply the bias of Republican-affiliated polls by -1 and keep the bias of Democratic-affiliated polls the same, we have a new measure of bias either towards one’s own party (in the positive direction) or against one’s own party (in the negative direction.) Our null hypothesis is that the true means are equal, and the alternative hypothesis is that they are not equal. Below, we repeat the process of testing for significance in the difference in means. 
+
+```{r}
+
+#Creates new column that measures bias as either for or against one's party
+general_dr_polls <- general_dr_polls %>% 
+  mutate(bias_adj = if_else(partisan == "R", bias*-1, if_else(partisan == "NP", NA, bias)))
+
+#Calculates observed difference in means
+d_hat_bias_dvr <- general_dr_polls %>% 
+  filter(partisan == "R" | partisan == "D") %>%
+  specify(bias_adj ~ partisan) %>% 
+  calculate(stat = "diff in means", order = c("D", "R"))
+
+#Creates null distribution
+null_dist_bias_dvr <- general_dr_polls %>%
+  filter(partisan == "R" | partisan == "D") %>%
+  specify(bias_adj ~ partisan) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 1000, type = "permute") %>%
+  calculate(stat = "diff in means", order = c("D", "R"))
+
+#Visualizes null distribution with observed statistic
+visualize(null_dist_bias_dvr) +
+  shade_p_value(obs_stat = d_hat_bias_dvr, direction = "two-sided")
+
+#Calculates p-value
+null_dist_bias_dvr %>%
+  get_p_value(obs_stat = d_hat_bias_dvr, direction = "two-sided")
+
+```
+
+We reject the null hypothesis, and conclude that Democratic-affiliated polls are meaningfully more biased than Republican-affiliated polls.
+
+# Findings and Recommendations
+
+Based on our analysis, we conclude the following:
+
+1) Democratic-affiliated polls have a higher average error than non-partisan polls, and exhibit a greater bias toward Democrats than non-partisan polls.
+2) Republican affiliated polls do not have a higher average error than non-partisan polls, but do exhibit a greater bias toward Republicans than non-partisan polls.
+3) Democratic-affiliated polls have a higher average error than Republican-affiliated polls, and exhibit a greater bias toward Democrats than Republican-affiliated polls do toward Republicans.
+
+The most interesting of these findings is #2, as it may seem counterintuitive that Republican-affiliated polls could be as accurate as non-partisan polls but also exhibit a clear bias that is not present in non-partisan polls. To illustrate how this is possible, consider two dart-throwers aiming at a target. One always misses 3 inches to the left, and the other misses 3 inches to the left half of the time and 3 inches to the right half of the time. Although they both miss by the same amount, the first dart-thrower is exhibiting a clear bias toward one side, while the other is not. In this same way, Republican-affiliated and non-partisan polls both miss the final election margin by about 4.7 points on average, but the Republican-affiliated polls predominantly make this error in a way that overstates the standing of the Republican candidate, a pattern that is not evident in non-partisan polls.
+
+The finding that both parties' polls exhibit a greater bias toward that party (in other words, a tendency to overstate that party's advantage or understate their disadvantage in the subsequent election) underlines the necessity to be cautious when interpreting partisan-affiliated polls. Furthermore, the high average error of polls from all partisan affiliations, including non-partisan, is cause for caution when using them to make confident predictions about close elections. While we believe that polling can be a valuable indication of the feelings of the electorate, the famous saying that "the only poll that counts is on election day" still holds true.
